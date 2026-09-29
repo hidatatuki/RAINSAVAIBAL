@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>RAIN SURVIVAL: RANKING</title>
+    <style>
+        body { margin: 0; background: #050505; color: #fff; font-family: 'Courier New', monospace; overflow: hidden; touch-action: none; }
+        canvas { display: block; cursor: none; }
+        #ui { position: absolute; top: 10px; left: 10px; pointer-events: none; font-size: 16px; }
+        #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; background: rgba(0,0,0,0.9); text-align: center; padding: 20px; box-sizing: border-box; }
+        .ranking-list { margin: 10px 0; font-size: 16px; color: #00ffcc; line-height: 1.5; }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        SURVIVAL TIME: <span id="score">0.0</span>s<br>
+        CURRENT LEVEL: <span id="level">1</span>
+        <div id="event" style="color: #ff0000; font-weight: bold; margin-top: 5px;"></div>
+    </div>
+    <div id="overlay">
+        <h1 style="color:#aaa; font-size: 32px; margin: 10px 0;" id="titleText">RAIN SURVIVAL</h1>
+        <div id="finalStats" style="font-size: 18px; color: yellow; margin: 10px 0;"></div>
+        <div id="rankingContainer">
+            <div style="font-size: 18px; color: #fff; border-bottom: 1px solid #444; padding-bottom: 5px;">--- HIGH SCORES ---</div>
+            <div id="rankingList" class="ranking-list"></div>
+        </div>
+        <p id="startMsg" style="margin-top: 15px;">Press [ENTER] or Tap to START</p>
+    </div>
+    <canvas id="gameCanvas"></canvas>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+let startTime = 0, isGameOver = true, shield = 0, isHeavyRain = false;
+let heavyRainCount = 0, shieldCollectedCount = 0; 
+let player = { x: canvas.width / 2, y: canvas.height / 2 };
+let drops = [], effects = [], lightnings = [];
+const pressedKeys = new Set();
+
+let audioCtx, ambientSource = null, ambientGain = null;
+
+// ランキング表示の初期化
+updateRankingDisplay();
+
+function initAudio() {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    if (!ambientSource) {
+        const bufferSize = audioCtx.sampleRate * 2.0;
+        const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+        for (let i = 0; i < bufferSize; i++) buffer.getChannelData(0)[i] = Math.random() * 2 - 1;
+        ambientSource = audioCtx.createBufferSource();
+        ambientSource.buffer = buffer; ambientSource.loop = true;
+        const filter = audioCtx.createBiquadFilter(); filter.type = 'lowpass'; filter.frequency.value = 800;
+        ambientGain = audioCtx.createGain(); ambientGain.gain.value = 0.05;
+        ambientSource.connect(filter); filter.connect(ambientGain); ambientGain.connect(audioCtx.destination);
+        ambientSource.start();
+    }
+}
+
+function setRainIntensity(isHeavy) {
+    if (!ambientGain) return;
+    ambientGain.gain.linearRampToValueAtTime(isHeavy ? 0.25 : 0.05, audioCtx.currentTime + 0.5);
+}
+
+function playDropSound() {
+    if (!audioCtx) return;
+    const isLarge = Math.random() > 0.7;
+    const osc = audioCtx.createOscillator();
+    const gainNode = audioCtx.createGain();
+    const baseFreq = isLarge ? 250 : 500;
+    const duration = isLarge ? 0.2 : 0.08;
+    osc.frequency.setValueAtTime(baseFreq + (Math.random()-0.5)*100, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(baseFreq * 0.5, audioCtx.currentTime + 0.1);
+    gainNode.gain.setValueAtTime(isLarge ? 0.06 : 0.02, audioCtx.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    osc.connect(gainNode); gainNode.connect(audioCtx.destination);
+    osc.start(); osc.stop(audioCtx.currentTime + duration);
+}
+
+function playThunderSound() {
+    if (!audioCtx) return;
+    const buffer = audioCtx.createBuffer(1, audioCtx.sampleRate * 2, audioCtx.sampleRate);
+    for (let i = 0; i < buffer.length; i++) buffer.getChannelData(0)[i] = (Math.random()*2-1)*3.5;
+    const noise = audioCtx.createBufferSource(); noise.buffer = buffer;
+    const filter = audioCtx.createBiquadFilter(); filter.type = 'lowpass'; filter.frequency.value = 200;
+    const gain = audioCtx.createGain(); gain.gain.setValueAtTime(0.5, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 2.0);
+    noise.connect(filter); filter.connect(gain); gain.connect(audioCtx.destination);
+    noise.start();
+}
+
+function playShieldBurstSound() {
+    if (!audioCtx) return;
+    const osc = audioCtx.createOscillator(); const gain = audioCtx.createGain();
+    osc.type = 'square'; osc.frequency.setValueAtTime(2500, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(100, audioCtx.currentTime + 0.3);
+    gain.gain.setValueAtTime(0.15, audioCtx.currentTime); gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.3);
+    osc.connect(gain); gain.connect(audioCtx.destination); osc.start(); osc.stop(audioCtx.currentTime + 0.3);
+}
+
+// --- ランキング管理関数 ---
+function getRanking() {
+    const data = localStorage.getItem('rain_survival_ranking');
+    return data ? JSON.parse(data) : [];
+}
+
+function saveScore(time) {
+    let ranking = getRanking();
+    ranking.push(parseFloat(time));
+    ranking.sort((a, b) => b - a); // 降順ソート（高い順）
+    ranking = ranking.slice(0, 5); // 上位5件まで保持
+    localStorage.setItem('rain_survival_ranking', JSON.stringify(ranking));
+}
+
+function updateRankingDisplay() {
+    const ranking = getRanking();
+    const listEl = document.getElementById('rankingList');
+    if (ranking.length === 0) {
+        listEl.innerHTML = "NO RECORDS YET";
+        return;
+    }
+    let html = "";
+    ranking.forEach((score, index) => {
+        let medal = ["🥇", "🥈", "🥉"][index] || `#${index+1}`;
+        html += `${medal} ${score.toFixed(1)}s<br>`;
+    });
+    listEl.innerHTML = html;
+}
+// ------------------------
+
+function startGame() {
+    initAudio(); 
+    drops = []; effects = []; lightnings = []; shield = 0; isHeavyRain = false;
+    heavyRainCount = 0; shieldCollectedCount = 0;
+    isGameOver = false; 
+    document.getElementById('overlay').style.display = 'none'; 
+    startTime = Date.now(); 
+    animate();
+}
+
+window.addEventListener('mousemove', e => { 
+    if (!isGameOver) { player.x = e.clientX; player.y = e.clientY; }
+});
+
+window.addEventListener('keydown', e => { 
+    if (isGameOver && e.key === 'Enter') { startGame(); }
+    const key = e.key.toLowerCase();
+    if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', 'w', 'a', 's', 'd'].includes(key)) {
+        pressedKeys.add(key);
+        e.preventDefault();
+    }
+});
+
+window.addEventListener('keyup', e => pressedKeys.delete(e.key.toLowerCase()));
+window.addEventListener('blur', () => pressedKeys.clear());
+
+function movePlayerWithInput() {
+    let horizontal = (pressedKeys.has('d') || pressedKeys.has('arrowright') ? 1 : 0)
+        - (pressedKeys.has('a') || pressedKeys.has('arrowleft') ? 1 : 0);
+    let vertical = (pressedKeys.has('s') || pressedKeys.has('arrowdown') ? 1 : 0)
+        - (pressedKeys.has('w') || pressedKeys.has('arrowup') ? 1 : 0);
+    const gamepad = navigator.getGamepads
+        ? Array.from(navigator.getGamepads()).find(controller => controller && controller.connected)
+        : null;
+    if (gamepad) {
+        horizontal += (gamepad.buttons[15]?.pressed ? 1 : 0) - (gamepad.buttons[14]?.pressed ? 1 : 0);
+        vertical += (gamepad.buttons[13]?.pressed ? 1 : 0) - (gamepad.buttons[12]?.pressed ? 1 : 0);
+    }
+    const distance = Math.hypot(horizontal, vertical);
+    if (distance === 0) return;
+
+    const speed = 5;
+    player.x = Math.max(0, Math.min(canvas.width, player.x + horizontal / distance * speed));
+    player.y = Math.max(0, Math.min(canvas.height, player.y + vertical / distance * speed));
+}
+
+window.addEventListener('touchstart', e => {
+    if (isGameOver) {
+        startGame();
+    } else if (e.touches.length > 0) {
+        player.x = e.touches[0].clientX;
+        player.y = e.touches[0].clientY;
+    }
+}, { passive: false });
+
+window.addEventListener('touchmove', e => {
+    if (!isGameOver && e.touches.length > 0) {
+        player.x = e.touches[0].clientX;
+        player.y = e.touches[0].clientY;
+        e.preventDefault();
+    }
+}, { passive: false });
+
+function endGame() {
+    isGameOver = true;
+    const finalTime = ((Date.now() - startTime) / 1000).toFixed(1);
+    const level = Math.floor(1 + (finalTime / 15));
+    
+    // スコアを保存してランキングを更新
+    saveScore(finalTime);
+    updateRankingDisplay();
+
+    document.getElementById('titleText').innerText = "GAME OVER";
+    document.getElementById('finalStats').innerHTML = `Time: ${finalTime}s / Level: ${level}<br>Heavy Rains: ${heavyRainCount} | Shields: ${shieldCollectedCount}`;
+    document.getElementById('startMsg').innerText = "Tap or Press [ENTER] to RESTART";
+    document.getElementById('overlay').style.display = 'flex';
+}
+
+function animate() {
+    if(isGameOver) return;
+    movePlayerWithInput();
+    ctx.fillStyle = 'rgba(0,0,0,0.3)'; ctx.fillRect(0,0,canvas.width, canvas.height);
+    let elapsed = (Date.now() - startTime) / 1000;
+    let level = Math.floor(1 + (elapsed / 15));
+    let lvMultiplier = 1 + (elapsed / 45); 
+    let triggerShieldBurst = false; 
+
+    if (!isHeavyRain && Math.random() < (0.0001 + level * 0.0001)) {
+        isHeavyRain = true; heavyRainCount++; setRainIntensity(true); document.getElementById('event').innerText = "!!! HEAVY RAIN !!!";
+        setTimeout(() => { isHeavyRain = false; setRainIntensity(false); document.getElementById('event').innerText = ""; }, 3000);
+    }
+
+    document.getElementById('score').innerText = elapsed.toFixed(1);
+    document.getElementById('level').innerText = level;
+
+    if (level >= 2 && Math.random() < (0.0005 + (level - 2) * 0.001)) {
+        lightnings.push({ x: Math.random() * canvas.width, width: 60, state: 'warning', timer: 90, path: [] });
+    }
+
+    lightnings.forEach((l) => {
+        if (triggerShieldBurst) return; 
+        if (l.state === 'warning') {
+            ctx.fillStyle = (l.timer % 10 < 5) ? 'rgba(255, 0, 0, 0.4)' : 'rgba(255, 0, 0, 0.1)';
+            ctx.fillRect(l.x - l.width/2, 0, l.width, canvas.height);
+            l.timer--;
+            if (l.timer <= 0) {
+                l.state = 'strike'; l.timer = 15; playThunderSound();
+                let cy = 0; let cx = l.x; l.path.push({x: cx, y: cy});
+                while (cy < canvas.height) { cy += 20 + Math.random() * 30; cx = l.x + (Math.random() - 0.5) * l.width; l.path.push({x: cx, y: cy}); }
+            }
+        } else if (l.state === 'strike') {
+            if (l.timer > 10) { ctx.fillStyle = `rgba(255, 255, 0, ${(l.timer - 10) / 10})`; ctx.fillRect(0, 0, canvas.width, canvas.height); }
+            ctx.beginPath(); ctx.moveTo(l.path[0].x, l.path[0].y);
+            for (let j = 1; j < l.path.length; j++) { ctx.lineTo(l.path[j].x + (Math.random()-0.5)*10, l.path[j].y); }
+            ctx.shadowBlur = 10; ctx.shadowColor = 'yellow'; ctx.strokeStyle = 'yellow'; ctx.stroke();
+            ctx.shadowBlur = 0;
+            if (Math.abs(player.x - l.x) < l.width/2) { if (shield > 0) triggerShieldBurst = true; else endGame(); }
+            l.timer--; if (l.timer <= 0) l.consumed = true;
+        }
+    });
+
+    if (shield > 0) {
+        ctx.beginPath(); ctx.arc(player.x, player.y, 15, 0, Math.PI * 2); 
+        ctx.strokeStyle = ['#00aaff', '#aa00ff', '#ff0000'][shield-1]; ctx.stroke();
+    }
+
+    effects.forEach((e) => {
+        e.r += 5; e.a -= 0.05; ctx.beginPath(); ctx.arc(e.x, e.y, e.r, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(255,255,255,${e.a})`; ctx.stroke(); if(e.a <= 0) e.consumed = true;
+    });
+
+    ctx.fillStyle = '#fff'; ctx.fillRect(player.x-3, player.y-3, 6, 6);
+
+    let spawnRate = (0.05 + (elapsed / 1000)) * (isHeavyRain ? 5 : 1);
+    if(Math.random() < spawnRate) {
+        let isShield = Math.random() < 0.05;
+        let isTracking = level >= 3 && Math.random() < (0.01 + (level - 3) * 0.005);
+        drops.push({ 
+            x: Math.random() * canvas.width, y: -20, 
+            speed: (1.5 + Math.random() * 5) * lvMultiplier, 
+            size: isShield ? 12 : (2 + Math.random() * 20), 
+            type: isShield ? 'shield' : (isTracking ? 'tracking' : 'enemy'), 
+            vx: 0 
+        });
+    }
+
+    drops.forEach((d) => {
+        if(d.type === 'tracking') { d.vx += (player.x - d.x) * 0.001; d.x += d.vx; }
+        d.y += d.speed;
+        ctx.fillStyle = d.type === 'shield' ? '#fff' : (d.type === 'tracking' ? '#8a2be2' : '#00aaff');
+        ctx.fillRect(d.x, d.y, d.size/3, d.size*2);
+        if(Math.hypot(d.x - player.x, d.y - player.y) < d.size) {
+            if(d.type === 'shield') { if(shield < 3) shield++; shieldCollectedCount++; d.consumed = true; } 
+            else { if(shield > 0) triggerShieldBurst = true; else endGame(); }
+        }
+        if(d.y > canvas.height) { d.consumed = true; if (Math.random() < 0.2) playDropSound(); }
+    });
+
+    if (triggerShieldBurst) { effects.push({x: player.x, y: player.y, r: 0, a: 1}); shield--; playShieldBurstSound(); drops = []; lightnings = []; }
+    else { drops = drops.filter(d => !d.consumed); effects = effects.filter(e => !e.consumed); lightnings = lightnings.filter(l => !l.consumed); }
+    if(!isGameOver) requestAnimationFrame(animate);
+}
+</script>
+</body>
+</html>
